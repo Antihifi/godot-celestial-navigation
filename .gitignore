@@ -1,0 +1,11 @@
+# Godot
+.godot/
+*.import
+*.uid
+
+# Generated catalog (users should run the EditorScript themselves)
+addons/celestial_nav/polynesian_stars.tres
+
+# OS
+.DS_Store
+Thumbs.db
