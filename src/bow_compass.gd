@@ -15,18 +15,24 @@ extends Node3D
 ## visible above the horizon appear as glowing points on the ring,
 ## positioned by their bow-relative azimuth, lifted above the ring plane
 ## according to their altitude (horizon stars sit on the ring, zenith
-## stars float above it). The cardinal directions N/E/S/W slide around
-## the ring to show which way in the world the boat is facing. The
-## focused star (from StarFocus) gets a Label3D floating above its
-## marker with the Polynesian name.
+## stars float above it). A single label fixed at the bow shows the name
+## of whichever traditional 32-house position the canoe is currently aimed
+## at (e.g. "Nā Leo Koʻolau" instead of Western N/E/S/W). The focused star
+## (from StarFocus) gets a Label3D floating above its marker with the
+## Polynesian name.
 ##
 ## Setup:
 ##   Canoe (Node3D)
 ##   └ BowCompass (this node, positioned on the prow where the ring sits)
 ##
 ## Then assign `celestial_sphere`, `catalog`, and (optionally) `star_focus`
-## in the inspector. The ring, notches, cardinals, star markers, and
+## in the inspector. The ring, notches, bow-house label, star markers, and
 ## focus label are all auto-built at runtime — no scene editing required.
+##
+## If your canoe model's bow points along +Z instead of -Z (common for
+## Blender-imported boats), set `bow_yaw_offset = PI` in the inspector —
+## this single knob keeps the bow-house label, `get_star_house()`, and any
+## downstream RouteSteering feedback in sync.
 ##
 ## The default TorusMesh ring is placeholder art. When you're ready to
 ## ship, assign a hand-carved wooden ring model to `custom_ring_mesh`
@@ -35,6 +41,12 @@ extends Node3D
 @export var celestial_sphere: CelestialSphere
 @export var catalog: StarCatalog
 @export var star_focus: StarFocus
+
+## Optional anchor node (Marker3D, BoneAttachment3D, any Node3D) the compass
+## snaps to each frame. Let users place the anchor anywhere on their vessel
+## (mast top, bow crossbeam, above deck) without needing to reparent this
+## node. If unset, BowCompass uses its own transform (default behaviour).
+@export var anchor: Node3D
 
 ## Optional custom ring mesh. If set, used instead of the procedural
 ## TorusMesh placeholder. Any mesh centered on its origin and oriented
@@ -79,6 +91,15 @@ extends Node3D
 ## hidden. Match your CelestialSphere's cutoff for consistency.
 @export_range(-0.2, 0.2, 0.005) var horizon_cutoff: float = -0.02
 
+## Yaw offset (radians) added to the canoe's apparent forward direction.
+## Godot convention is that local -Z = forward, but many imported boat
+## models have their bow pointing along +Z (Blender exports do this). If
+## your bow-house label appears at the stern instead of the bow, set this
+## to PI (≈3.14). Affects both the visible bow-house label AND the
+## hull-relative house index returned by `get_star_house()` — both must
+## share the same convention or steering feedback inverts silently.
+@export_range(-PI, PI, 0.01) var bow_yaw_offset: float = 0.0
+
 ## How much faint / unlearned stars dim relative to learned ones.
 @export_range(0.0, 1.0, 0.01) var unlearned_dimming: float = 0.35
 
@@ -99,18 +120,33 @@ extends Node3D
 var _canoe: Node3D
 var _ring_instance: MeshInstance3D
 var _notches: Array[MeshInstance3D] = []
-var _cardinal_labels: Array[Label3D] = []
+var _notch_base_colors: Array[Color] = []
+var _notch_materials: Array[StandardMaterial3D] = []
+var _bow_house_label: Label3D
 var _star_markers: Dictionary = {}  # id -> {mesh, mat, entry}
 var _focus_label: Label3D
 var _star_shader: Shader
+var _target_house: int = -1  # -1 = no active target
 
-# Each cardinal: [letter, world_azimuth_radians]. 0 = +Z world = north.
-const CARDINAL_DIRS := [
-	["N", 0.0],
-	["E", PI * 0.5],
-	["S", PI],
-	["W", -PI * 0.5],
+## Traditional Hawaiian 32-house star compass, arranged clockwise starting
+## at true north (house 0). These are the names navigators use for the
+## positions where stars rise / set on the horizon — the diegetic
+## alternative to N/E/S/W. Houses are world-oriented (fixed to horizon),
+## not hull-relative.
+const HAWAIIAN_HOUSES := [
+	"Haka Koʻolau", "Nā Leo Koʻolau", "Nālani Koʻolau", "Manu Koʻolau",
+	"Noio Koʻolau", "ʻĀina Koʻolau", "Lā Koʻolau", "Hikina Koʻolau",
+	"Hikina", "Hikina Malanai", "Lā Malanai", "ʻĀina Malanai",
+	"Noio Malanai", "Manu Malanai", "Nālani Malanai", "Nā Leo Malanai",
+	"Hema", "Nā Leo Kona", "Nālani Kona", "Manu Kona",
+	"Noio Kona", "ʻĀina Kona", "Lā Kona", "Komohana Kona",
+	"Komohana", "Komohana Hoʻolua", "Lā Hoʻolua", "ʻĀina Hoʻolua",
+	"Noio Hoʻolua", "Manu Hoʻolua", "Nālani Hoʻolua", "Nā Leo Hoʻolua",
 ]
+
+## Color applied to the target-house notch when an active route sets one
+## via `set_target_house()`. Intentionally bright so it reads at a glance.
+@export var target_notch_color: Color = Color(0.4, 1.0, 0.55)
 
 
 func _ready() -> void:
@@ -118,7 +154,7 @@ func _ready() -> void:
 	_star_shader = _load_star_shader()
 	_build_ring()
 	_build_notches()
-	_build_cardinals()
+	_build_bow_house_label()
 	_build_focus_label()
 	_build_star_markers()
 
@@ -149,8 +185,7 @@ func get_star_house(star_id: String) -> int:
 	var dir: Vector3 = celestial_sphere.get_star_direction(star_id)
 	if dir == Vector3.ZERO or dir.y < horizon_cutoff:
 		return -1
-	var canoe_fwd: Vector3 = -_canoe.global_transform.basis.z
-	var canoe_yaw: float = atan2(canoe_fwd.x, canoe_fwd.z)
+	var canoe_yaw: float = get_canoe_world_yaw()
 	var world_az: float = atan2(dir.x, dir.z)
 	# Normalize to [0, TAU) so the house index wraps cleanly.
 	var rel: float = fposmod(world_az - canoe_yaw, TAU)
@@ -159,6 +194,32 @@ func get_star_house(star_id: String) -> int:
 	# than the one they just crossed into — feels more forgiving to steer.
 	var idx: int = int(round(rel / house_width)) % notch_count
 	return idx
+
+
+## Highlight a specific house's notch (bow-relative, 0..notch_count-1) as
+## the steering target. Call this when the player activates a learned
+## route — the lit notch tells them where to aim the guide star.
+## Pass -1 (or call `clear_target_house`) to remove the highlight.
+func set_target_house(house: int) -> void:
+	if house == _target_house:
+		return
+	# Restore previously-highlighted notch to its base color.
+	if _target_house >= 0 and _target_house < _notch_materials.size():
+		var prev: StandardMaterial3D = _notch_materials[_target_house]
+		var base: Color = _notch_base_colors[_target_house]
+		prev.albedo_color = base
+		prev.emission = base
+		prev.emission_energy_multiplier = 0.5 if (_target_house % major_notch_every) == 0 else 0.25
+	_target_house = house
+	if house >= 0 and house < _notch_materials.size():
+		var mat: StandardMaterial3D = _notch_materials[house]
+		mat.albedo_color = target_notch_color
+		mat.emission = target_notch_color
+		mat.emission_energy_multiplier = 1.5
+
+
+func clear_target_house() -> void:
+	set_target_house(-1)
 
 
 ## Returns the angular error in radians between a star's current bearing
@@ -171,8 +232,7 @@ func get_star_house_error(star_id: String, target_house: int) -> float:
 	var dir: Vector3 = celestial_sphere.get_star_direction(star_id)
 	if dir == Vector3.ZERO or dir.y < horizon_cutoff:
 		return INF
-	var canoe_fwd: Vector3 = -_canoe.global_transform.basis.z
-	var canoe_yaw: float = atan2(canoe_fwd.x, canoe_fwd.z)
+	var canoe_yaw: float = get_canoe_world_yaw()
 	var world_az: float = atan2(dir.x, dir.z)
 	var rel: float = fposmod(world_az - canoe_yaw, TAU)
 	var house_width: float = TAU / float(notch_count)
@@ -187,6 +247,22 @@ func get_star_house_error(star_id: String, target_house: int) -> float:
 ## Walks up the parent chain to find the first Node3D ancestor. Usually
 ## that's the immediate parent (the canoe), but we walk the chain to be
 ## robust to being nested under a pivot / mount / anchor Node3D.
+## Compute the canoe's bow heading in world space, applying the
+## `bow_yaw_offset` knob so models whose bow points along +Z (or any other
+## non-Godot-standard axis) read correctly. All hull-relative star math
+## funnels through this — getting it right here fixes the bow-house label,
+## `get_star_house`, and downstream steering feedback in one place.
+##
+## Public so external steering / feedback nodes can compute their own
+## hull-relative bearings (e.g. "the star is off your starboard").
+func get_canoe_world_yaw() -> float:
+	if _canoe == null:
+		return 0.0
+	var canoe_fwd: Vector3 = -_canoe.global_transform.basis.z
+	var raw_yaw: float = atan2(canoe_fwd.x, canoe_fwd.z)
+	return raw_yaw + bow_yaw_offset
+
+
 func _find_canoe() -> Node3D:
 	var p: Node = get_parent()
 	while p:
@@ -254,20 +330,22 @@ func _build_notches() -> void:
 		)
 		add_child(mi)
 		_notches.append(mi)
+		_notch_materials.append(mat)
+		_notch_base_colors.append(col)
 
 
-func _build_cardinals() -> void:
-	for pair in CARDINAL_DIRS:
-		var label := Label3D.new()
-		label.text = pair[0]
-		label.font_size = cardinal_font_size
-		label.modulate = cardinal_color
-		label.pixel_size = label_pixel_size
-		label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-		label.no_depth_test = true
-		label.render_priority = 1
-		add_child(label)
-		_cardinal_labels.append(label)
+func _build_bow_house_label() -> void:
+	_bow_house_label = Label3D.new()
+	_bow_house_label.text = ""
+	_bow_house_label.font_size = cardinal_font_size
+	_bow_house_label.modulate = cardinal_color
+	_bow_house_label.pixel_size = label_pixel_size
+	_bow_house_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	_bow_house_label.no_depth_test = true
+	_bow_house_label.render_priority = 1
+	# Dead ahead, slightly outside the ring.
+	_bow_house_label.position = _ring_local_position(0.0, 0.02) * 1.12
+	add_child(_bow_house_label)
 
 
 func _build_focus_label() -> void:
@@ -318,22 +396,26 @@ func _process(_delta: float) -> void:
 	if celestial_sphere == null or _canoe == null:
 		return
 
+	# Snap to anchor node if assigned. Lets users place a Marker3D anywhere
+	# on the vessel (mast top, prow, gunwale) and have the compass follow it
+	# without reparenting BowCompass itself.
+	if anchor and is_instance_valid(anchor):
+		global_transform = anchor.global_transform
+
 	# Yaw of the canoe in world space. We rotate world-space star
 	# azimuths into this frame so markers sit at their bow-relative
 	# bearings on the ring.
-	var canoe_fwd: Vector3 = -_canoe.global_transform.basis.z
-	var canoe_yaw: float = atan2(canoe_fwd.x, canoe_fwd.z)
+	var canoe_yaw: float = get_canoe_world_yaw()
 
-	# --- Cardinal labels ---
-	# These slide around the ring as the boat turns, always pointing at
-	# true world N/E/S/W.
-	for i in range(_cardinal_labels.size()):
-		var label: Label3D = _cardinal_labels[i]
-		var world_angle: float = CARDINAL_DIRS[i][1]
-		var rel: float = _wrap(world_angle - canoe_yaw)
-		# Place just outside the ring so the letters don't collide with
-		# notches and stars.
-		label.position = _ring_local_position(rel, 0.02) * 1.08
+	# --- Bow-house label ---
+	# Shows the name of whichever traditional house the bow currently points
+	# at in world space. This is the diegetic replacement for the Western
+	# cardinal letters: instead of "bow on E by NE", the player reads
+	# "bow on Lā Koʻolau".
+	if _bow_house_label:
+		var bow_house: int = _world_azimuth_to_house(canoe_yaw)
+		if bow_house >= 0 and bow_house < HAWAIIAN_HOUSES.size():
+			_bow_house_label.text = HAWAIIAN_HOUSES[bow_house]
 
 	# --- Star markers ---
 	var focused_id: String = ""
@@ -405,3 +487,13 @@ func _ring_local_position(rel: float, lift: float) -> Vector3:
 
 static func _wrap(a: float) -> float:
 	return fposmod(a + PI, TAU) - PI
+
+
+## Convert a world-space azimuth (radians, 0 = +Z / north, clockwise) into
+## a house index in [0, notch_count). Used for the bow-house label — the
+## bow's world yaw, fed in here, returns which traditional house the
+## canoe is currently aimed at.
+func _world_azimuth_to_house(world_az: float) -> int:
+	var house_width: float = TAU / float(notch_count)
+	var a: float = fposmod(world_az, TAU)
+	return int(round(a / house_width)) % notch_count

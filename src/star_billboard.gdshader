@@ -18,13 +18,17 @@ uniform vec4 star_color : source_color = vec4(1.0, 0.98, 0.92, 1.0);
 uniform float brightness : hint_range(0.0, 10.0) = 1.0;
 
 // Tight bright center of the star.
-uniform float core_radius : hint_range(0.0, 0.5) = 0.08;
+uniform float core_radius : hint_range(0.0, 0.5) = 0.12;
 uniform float core_softness : hint_range(0.001, 0.5) = 0.05;
 
 // Wider soft halo around the core. This is what makes stars read as
 // *stars* rather than pixels — don't skip it.
 uniform float glow_radius : hint_range(0.0, 1.0) = 0.5;
-uniform float glow_strength : hint_range(0.0, 2.0) = 0.35;
+uniform float glow_strength : hint_range(0.0, 2.0) = 0.8;
+
+// Minimum core intensity — keeps stars visible even after aggressive
+// cel-banding / posterize post-processes crush additive highlights.
+uniform float min_core_intensity : hint_range(0.0, 5.0) = 1.5;
 
 // Optional 4-point diffraction spike (set to 0 for clean disc).
 uniform float spike_strength : hint_range(0.0, 2.0) = 0.0;
@@ -71,6 +75,9 @@ void fragment() {
 	}
 
 	float intensity = (core + glow + spikes) * brightness;
+	// Guarantee the core reads as a solid bright dot even at low brightness —
+	// this lets stars punch through cel/posterize post-processing.
+	intensity = max(intensity, core * min_core_intensity);
 	ALBEDO = star_color.rgb * intensity;
 	ALPHA = clamp(intensity, 0.0, 1.0) * star_color.a;
 }

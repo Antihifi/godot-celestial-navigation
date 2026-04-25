@@ -37,11 +37,11 @@ extends Node3D
 ## Radius of the star sphere, in meters. Should be larger than your camera's
 ## typical draw distance but less than its far plane. 4000-8000 is usually
 ## right — far enough to feel infinite, close enough not to get clipped.
-@export var radius: float = 5000.0
+@export var radius: float = 3500.0
 
 ## Base size of a star billboard at brightness=1.0, in meters at the
 ## sphere radius. Scale this if stars look too small or too chunky.
-@export var base_star_size: float = 60.0
+@export var base_star_size: float = 300.0
 
 ## Observer latitude in degrees. 0 = equator (Tahiti), +20 = Hawaii-ish,
 ## -20 = Aotearoa-ish. Drive this from your player's world position if you
@@ -68,7 +68,7 @@ extends Node3D
 @export_range(-0.2, 0.2, 0.005) var horizon_cutoff: float = -0.02
 
 ## How much faint / unlearned stars dim relative to learned ones.
-@export_range(0.0, 1.0, 0.01) var unlearned_dimming: float = 0.35
+@export_range(0.0, 1.0, 0.01) var unlearned_dimming: float = 0.7
 
 @export_group("Highlighting")
 ## Extra brightness multiplier applied to highlighted stars.
@@ -96,9 +96,11 @@ var _time_accum: float = 0.0
 func _ready() -> void:
 	_shader = load("res://addons/celestial_nav/star_billboard.gdshader") as Shader
 	if _shader == null:
-		# Fall back to a sibling path if the user dropped the files
-		# somewhere other than addons/celestial_nav/.
 		_shader = load((get_script() as Script).resource_path.get_base_dir() + "/star_billboard.gdshader") as Shader
+	# Clamp radius to stay within typical Camera3D far plane (4000m default).
+	var cam: Camera3D = get_viewport().get_camera_3d()
+	if cam:
+		radius = minf(radius, cam.far * 0.85)
 	_rebuild_if_needed()
 
 
@@ -201,11 +203,17 @@ func _rebuild_if_needed() -> void:
 		return
 	_dirty = false
 
+	# Remove tracked star nodes.
 	for n in _star_nodes:
 		if is_instance_valid(n):
 			n.queue_free()
 	_star_nodes.clear()
 	_materials.clear()
+
+	# Also remove stale MeshInstance3D children saved by @tool in the editor.
+	for child in get_children():
+		if child is MeshInstance3D:
+			child.queue_free()
 
 	if catalog == null or _shader == null:
 		return
@@ -220,6 +228,9 @@ func _rebuild_if_needed() -> void:
 		mi.mesh = quad
 		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		mi.extra_cull_margin = radius  # Prevent frustum-culling at sphere edge.
+		# top_level=true: ignore parent (camera) rotation so stars stay fixed
+		# in world space while still following the camera's position.
+		mi.top_level = true
 
 		var mat := ShaderMaterial.new()
 		mat.shader = _shader
@@ -228,8 +239,11 @@ func _rebuild_if_needed() -> void:
 		mi.material_override = mat
 
 		add_child(mi)
-		if Engine.is_editor_hint():
-			mi.owner = get_tree().edited_scene_root
+		# Intentionally do NOT set mi.owner in the editor. Billboards are
+		# transient preview meshes regenerated every time the scene reloads.
+		# Setting owner=edited_scene_root serialized them into the .tscn and
+		# then our startup cleanup queue_free'd them, leaving stale paths in
+		# the editor's Scene Tree dock (flood of "Node not found" errors).
 		_star_nodes.append(mi)
 		_materials.append(mat)
 
@@ -257,8 +271,10 @@ func _update_star_transforms() -> void:
 			continue
 		mi.visible = true
 
-		# Position on sphere.
-		mi.position = dir * radius
+		# Position on sphere. top_level=true means we write global_position,
+		# which is world-space = camera position + dir*radius. This keeps
+		# stars fixed in the sky while they follow the player's location.
+		mi.global_position = global_position + dir * radius
 
 		# Size: scale with radius so angular size stays constant, boosted
 		# by brightness, and again by highlight state.
@@ -282,3 +298,10 @@ func _update_star_transforms() -> void:
 
 		mi.scale = Vector3.ONE * size
 		mat.set_shader_parameter(&"brightness", brightness_final)
+		# Bump core intensity when highlighted so the focused star pokes
+		# through aggressive cel / posterize post-processing. Non-highlighted
+		# stars keep the default min_core_intensity from the shader.
+		if is_highlighted:
+			mat.set_shader_parameter(&"min_core_intensity", 3.5 * pulse)
+		else:
+			mat.set_shader_parameter(&"min_core_intensity", 1.5)

@@ -20,7 +20,7 @@ extends Node
 ## Angular tolerance in degrees. A star within this angle of the camera's
 ## forward vector is considered "focused." Larger = easier to focus but
 ## more ambiguous when stars are clustered.
-@export_range(0.5, 30.0, 0.1) var focus_angle_deg: float = 4.0
+@export_range(0.5, 30.0, 0.1) var focus_angle_deg: float = 7.0
 
 ## If true, unlearned stars cannot be focused. Turn this on once the
 ## progression system is wired up so players only interact with stars
@@ -32,7 +32,14 @@ extends Node
 ## focus is lost. Connect this to your HUD, audio, or quest system.
 signal focus_changed(star_id: String)
 
+## Grace period (seconds) after focus is lost during which `get_focused_id()`
+## still returns the last-focused star. Prevents click-misses when the player
+## wobbles the camera slightly while clicking.
+@export_range(0.0, 3.0, 0.05) var focus_grace_seconds: float = 1.5
+
 var _focused_id: String = ""
+var _last_focused_id: String = ""
+var _time_since_focus_lost: float = 0.0
 
 
 func _ready() -> void:
@@ -42,9 +49,11 @@ func _ready() -> void:
 			camera = parent
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if celestial_sphere == null or celestial_sphere.catalog == null or camera == null:
 		return
+
+	_time_since_focus_lost += delta
 
 	var fwd: Vector3 = -camera.global_transform.basis.z
 	var best_id: String = ""
@@ -67,19 +76,29 @@ func _process(_delta: float) -> void:
 	if best_id != _focused_id:
 		if _focused_id != "":
 			celestial_sphere.highlight(_focused_id, false)
+			_last_focused_id = _focused_id
+			_time_since_focus_lost = 0.0
 		if best_id != "":
 			celestial_sphere.highlight(best_id, true)
+			_last_focused_id = best_id
 		_focused_id = best_id
 		focus_changed.emit(best_id)
 
 
 ## Returns the currently-focused star id, or "" if none.
+## Within `focus_grace_seconds` of losing focus, still returns the
+## last-focused star so clicks aren't dropped by micro-wobble.
 func get_focused_id() -> String:
-	return _focused_id
+	if _focused_id != "":
+		return _focused_id
+	if _time_since_focus_lost < focus_grace_seconds and _last_focused_id != "":
+		return _last_focused_id
+	return ""
 
 
 ## Returns the currently-focused StarEntry, or null if none.
 func get_focused_entry() -> StarEntry:
-	if _focused_id == "" or celestial_sphere == null or celestial_sphere.catalog == null:
+	var id: String = get_focused_id()
+	if id == "" or celestial_sphere == null or celestial_sphere.catalog == null:
 		return null
-	return celestial_sphere.catalog.find_by_id(_focused_id)
+	return celestial_sphere.catalog.find_by_id(id)
