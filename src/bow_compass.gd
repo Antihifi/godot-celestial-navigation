@@ -29,10 +29,13 @@ extends Node3D
 ## in the inspector. The ring, notches, bow-house label, star markers, and
 ## focus label are all auto-built at runtime — no scene editing required.
 ##
-## If your canoe model's bow points along +Z instead of -Z (common for
-## Blender-imported boats), set `bow_yaw_offset = PI` in the inspector —
-## this single knob keeps the bow-house label, `get_star_house()`, and any
-## downstream RouteSteering feedback in sync.
+## If your canoe model uses non-standard local axes (common for Blender
+## imports — bow at +Z, starboard at -X), set `bow_axis_local` and
+## `starboard_axis_local` in the inspector to whichever axes actually
+## point at the bow and starboard in your model's local frame. All
+## bearing math (bow-house label, `get_star_house()`, RouteSteering)
+## is derived from these two vectors, so getting them right fixes
+## everything in one place.
 ##
 ## The default TorusMesh ring is placeholder art. When you're ready to
 ## ship, assign a hand-carved wooden ring model to `custom_ring_mesh`
@@ -91,16 +94,20 @@ extends Node3D
 ## hidden. Match your CelestialSphere's cutoff for consistency.
 @export_range(-0.2, 0.2, 0.005) var horizon_cutoff: float = -0.02
 
-## Y-axis rotation (radians) applied to the compass node's basis each
-## frame so its local -Z aligns with the canoe's actual bow direction
-## and its local +X aligns with starboard. Godot convention is bow=-Z,
-## starboard=+X, but many imported boat models have their bow at +Z
-## (Blender exports) — and that often comes paired with a flipped
-## starboard axis too. Setting this to PI rotates the entire local
-## frame at once, so star bearings, the bow-house label, the
-## `get_star_house()` index, and the steering feedback all read
-## correctly without any further per-axis hacks.
-@export_range(-PI, PI, 0.01) var bow_yaw_offset: float = 0.0
+## The canoe's BOW direction expressed in its own LOCAL frame. Godot
+## convention is -Z, but Blender/asset-store boats often have their bow
+## at +Z. Set this to whichever axis points at the bow when your canoe
+## model is at identity rotation. Combined with `starboard_axis_local`
+## this defines the hull's local frame so all bearing math stays correct
+## regardless of how the model was authored.
+@export var bow_axis_local: Vector3 = Vector3(0, 0, -1)
+
+## The canoe's STARBOARD direction expressed in its own LOCAL frame.
+## Godot convention is +X (right of bow when bow is -Z). Many imported
+## boats whose bow is at +Z also have starboard at -X — set this to
+## match. Must be perpendicular to `bow_axis_local` and lie roughly in
+## the horizontal plane.
+@export var starboard_axis_local: Vector3 = Vector3(1, 0, 0)
 
 ## How much faint / unlearned stars dim relative to learned ones.
 @export_range(0.0, 1.0, 0.01) var unlearned_dimming: float = 0.35
@@ -159,11 +166,6 @@ func _ready() -> void:
 	_build_bow_house_label()
 	_build_focus_label()
 	_build_star_markers()
-	# If no anchor is assigned, _process never overrides our transform, so
-	# the bow_yaw_offset rotation has to be baked into our local rotation
-	# once at startup. With an anchor, _process applies it every frame.
-	if anchor == null and bow_yaw_offset != 0.0:
-		rotate_y(bow_yaw_offset)
 
 
 # ---------------------------------------------------------------------
@@ -192,10 +194,7 @@ func get_star_house(star_id: String) -> int:
 	var dir: Vector3 = celestial_sphere.get_star_direction(star_id)
 	if dir == Vector3.ZERO or dir.y < horizon_cutoff:
 		return -1
-	var canoe_yaw: float = get_canoe_world_yaw()
-	var world_az: float = atan2(dir.x, dir.z)
-	# Normalize to [0, TAU) so the house index wraps cleanly.
-	var rel: float = fposmod(world_az - canoe_yaw, TAU)
+	var rel: float = _hull_relative_bearing(dir)
 	var house_width: float = TAU / float(notch_count)
 	# Round rather than floor so stars snap to the nearest house rather
 	# than the one they just crossed into — feels more forgiving to steer.
@@ -239,9 +238,7 @@ func get_star_house_error(star_id: String, target_house: int) -> float:
 	var dir: Vector3 = celestial_sphere.get_star_direction(star_id)
 	if dir == Vector3.ZERO or dir.y < horizon_cutoff:
 		return INF
-	var canoe_yaw: float = get_canoe_world_yaw()
-	var world_az: float = atan2(dir.x, dir.z)
-	var rel: float = fposmod(world_az - canoe_yaw, TAU)
+	var rel: float = _hull_relative_bearing(dir)
 	var house_width: float = TAU / float(notch_count)
 	var target_center: float = fposmod(float(target_house) * house_width, TAU)
 	return _wrap(rel - target_center)
@@ -254,16 +251,40 @@ func get_star_house_error(star_id: String, target_house: int) -> float:
 ## Walks up the parent chain to find the first Node3D ancestor. Usually
 ## that's the immediate parent (the canoe), but we walk the chain to be
 ## robust to being nested under a pivot / mount / anchor Node3D.
-## Compute the canoe's bow heading in world space. Reads from the
-## compass node's own basis — which `_process` rotates by
-## `bow_yaw_offset` each frame — so the value is already correct
-## regardless of the canoe model's local-axis convention.
+## Compute the canoe's bow heading in world space by projecting the
+## user-specified `bow_axis_local` through the canoe's current world
+## basis. Returns 0 if no canoe is found.
 ##
 ## Public so external steering / feedback nodes can compute their own
-## hull-relative bearings (e.g. "the star is off your starboard").
+## hull-relative bearings (e.g. "the star is off your starboard") using
+## the same convention.
 func get_canoe_world_yaw() -> float:
-	var fwd: Vector3 = -global_transform.basis.z
-	return atan2(fwd.x, fwd.z)
+	if _canoe == null:
+		return 0.0
+	var bow_world: Vector3 = _canoe.global_transform.basis * bow_axis_local
+	return atan2(bow_world.x, bow_world.z)
+
+
+## Returns a star's bow-relative bearing in radians, wrapped to [0, TAU).
+## 0 = dead bow, +PI/2 = dead starboard, +PI = dead astern,
+## +3PI/2 = dead port. Computed by projecting the star's horizontal
+## direction onto the (bow, starboard) plane defined by the user-
+## specified hull axes — so it's correct regardless of how the canoe
+## model was authored.
+func _hull_relative_bearing(star_dir: Vector3) -> float:
+	if _canoe == null:
+		return 0.0
+	var bow_world: Vector3 = (_canoe.global_transform.basis * bow_axis_local)
+	var stbd_world: Vector3 = (_canoe.global_transform.basis * starboard_axis_local)
+	# Flatten to horizontal plane — bearing is independent of altitude.
+	bow_world.y = 0.0
+	stbd_world.y = 0.0
+	bow_world = bow_world.normalized()
+	stbd_world = stbd_world.normalized()
+	var dir_h := Vector3(star_dir.x, 0.0, star_dir.z).normalized()
+	# atan2(starboard_component, bow_component): 0 = bow, +PI/2 = starboard.
+	var rel: float = atan2(dir_h.dot(stbd_world), dir_h.dot(bow_world))
+	return fposmod(rel, TAU)
 
 
 func _find_canoe() -> Node3D:
@@ -402,18 +423,8 @@ func _process(_delta: float) -> void:
 	# Snap to anchor node if assigned. Lets users place a Marker3D anywhere
 	# on the vessel (mast top, prow, gunwale) and have the compass follow it
 	# without reparenting BowCompass itself.
-	#
-	# After snapping, rotate the basis by `bow_yaw_offset` so the compass's
-	# local frame is Godot-standard (-Z=bow, +X=starboard) regardless of
-	# how the canoe model was authored. Doing this on the basis (not just
-	# adding to a yaw scalar) is what aligns the +X/starboard axis too —
-	# fixing the "ring rotates the wrong direction" mirror bug on canoes
-	# whose port axis sits where Godot would expect starboard.
 	if anchor and is_instance_valid(anchor):
-		var t: Transform3D = anchor.global_transform
-		if bow_yaw_offset != 0.0:
-			t.basis = t.basis.rotated(Vector3.UP, bow_yaw_offset)
-		global_transform = t
+		global_transform = anchor.global_transform
 
 	# Yaw of the canoe in world space. We rotate world-space star
 	# azimuths into this frame so markers sit at their bow-relative
@@ -449,8 +460,11 @@ func _process(_delta: float) -> void:
 			continue
 		mi.visible = true
 
-		var world_az: float = atan2(dir.x, dir.z)
-		var rel: float = _wrap(world_az - canoe_yaw)
+		# Bearing CW from bow toward starboard, using the user-defined
+		# hull axes so the placement is correct regardless of how the
+		# canoe model was authored. Wrapped to (-PI, PI] for symmetry
+		# around the bow.
+		var rel: float = _wrap(_hull_relative_bearing(dir))
 		# dir.y is sin(altitude), invariant under yaw, so we use it
 		# directly as the vertical lift from the ring plane.
 		var lifted: Vector3 = _ring_local_position(rel, dir.y * altitude_scale)
@@ -490,12 +504,15 @@ func _process(_delta: float) -> void:
 ## Place a point on the ring at bow-relative angle `rel` (0 = ahead,
 ## +PI/2 = starboard, ±PI = behind, -PI/2 = port) with vertical `lift`.
 ##
-## Note the `-cos` on the Z axis: in Godot, "forward" is local -Z, so
-## rel=0 must land at (0, lift, -ring_radius), not (0, lift, +ring_radius).
-## Getting this wrong puts your stars behind the boat and is the #1
-## thing to check if the compass looks rotated by 180°.
+## The position is constructed from the user-specified
+## `bow_axis_local` and `starboard_axis_local` so the ring is drawn in
+## the hull's actual coordinate frame regardless of how the canoe model
+## was authored. For Godot defaults (bow=-Z, starboard=+X) the formula
+## reduces to the classic `(sin(rel)*R, lift, -cos(rel)*R)`.
 func _ring_local_position(rel: float, lift: float) -> Vector3:
-	return Vector3(sin(rel) * ring_radius, lift, -cos(rel) * ring_radius)
+	var pos: Vector3 = (cos(rel) * bow_axis_local + sin(rel) * starboard_axis_local) * ring_radius
+	pos.y = lift
+	return pos
 
 
 static func _wrap(a: float) -> float:

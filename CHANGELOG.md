@@ -254,31 +254,58 @@ Every Polynesian / wayfinding-flavored game using this addon will want the star-
 
 ---
 
-## 10. BowCompass: bow-axis convention knob applied as a basis rotation (fixed)
+## 10. BowCompass: explicit `bow_axis_local` + `starboard_axis_local` exports (fixed)
 
 **File:** `bow_compass.gd`
 
-**Symptom:** Many imported boat models (Blender exports, asset-store canoes) have their bow pointing along local **+Z** instead of Godot's standard **-Z** — and frequently their port axis sits at +X where Godot would expect starboard. With the addon's previous assumption (`-_canoe.global_transform.basis.z == forward`):
+**Symptom:** Many imported boat models (Blender exports, asset-store canoes) have their bow pointing along local **+Z** instead of Godot's standard **-Z**, *and* their starboard axis sits at **-X** where Godot would expect **+X**. Symptoms compounded:
 
-- The bow-house label appeared at the **stern** end of the ring.
+- The bow-house label rendered at the stern end of the ring.
 - `get_star_house()` returned house indices counted from the stern.
 - Star markers landed on the **mirrored** side of the ring (a star to starboard rendered to port), and the ring rotated *backwards* as the canoe yawed.
+- Downstream RouteSteering "Turn to starboard" advice was silently inverted to port — observed by sailing toward an island visible dead ahead while the system insisted "turn left."
 
-The first two are 180° rotation bugs; the third is a +X/-X mirror. **Any single yaw-scalar offset only fixes the first two — the mirror persists** because the local +X axis is still pointing the wrong way.
+**Earlier attempts that didn't work:** A single `bow_yaw_offset` yaw-scalar export only corrected the bow/stern axis. A subsequent attempt to apply that offset as a real **basis rotation** (rotating the compass node 180° around Y so its local frame became Godot-standard) was *mathematically* correct but failed in practice because (a) the user-supplied value couldn't be relied on to be saved in the scene, and (b) for any canoe whose hull frame deviates from Godot convention by something other than a pure 180° Y rotation, even a correct rotation isn't sufficient.
 
-**Fix:** `@export_range(-PI, PI, 0.01) var bow_yaw_offset: float = 0.0` is now applied as a real **rotation of the compass node's basis** each frame (or once at `_ready` if no anchor is assigned), not as a scalar added to a derived yaw value. Rotating the basis around Y simultaneously corrects the forward axis AND the starboard axis, because rotating a frame 180° flips both -Z↔+Z and +X↔-X. After the rotation the compass's own local frame is Godot-standard regardless of how the canoe model was authored.
-
-Because the compass's basis is now correct in world, downstream math reads it directly:
+**Real fix:** Replace the single yaw scalar with two explicit Vector3 exports:
 
 ```gdscript
-func get_canoe_world_yaw() -> float:
-    var fwd: Vector3 = -global_transform.basis.z
-    return atan2(fwd.x, fwd.z)
+@export var bow_axis_local: Vector3 = Vector3(0, 0, -1)        # Godot default
+@export var starboard_axis_local: Vector3 = Vector3(1, 0, 0)   # Godot default
 ```
 
-Promoted to public API (`get_*` not `_*`) so external steering / feedback nodes can read the canoe's hull-relative bearing without re-deriving it. All three former call-sites (the two public `get_star_house*` methods plus the per-frame `_process` ring update) funnel through the helper.
+These describe the canoe's hull frame in **its own local coordinates**, with no assumption about Godot convention. All bearing math is rebuilt around them via a new private helper:
 
-For canoes whose bow points at +Z (or whose hull frame is otherwise rotated 180° from Godot convention), set `bow_yaw_offset = PI` in the inspector — done. The same knob fixes both the rotation AND the mirror in one move.
+```gdscript
+func _hull_relative_bearing(star_dir: Vector3) -> float:
+    var bow_world: Vector3   = _canoe.global_transform.basis * bow_axis_local
+    var stbd_world: Vector3  = _canoe.global_transform.basis * starboard_axis_local
+    bow_world.y = 0.0;  stbd_world.y = 0.0
+    bow_world = bow_world.normalized();  stbd_world = stbd_world.normalized()
+    var dir_h := Vector3(star_dir.x, 0.0, star_dir.z).normalized()
+    return fposmod(atan2(dir_h.dot(stbd_world), dir_h.dot(bow_world)), TAU)
+```
+
+Bearing is now computed as the angle between the star's horizontal direction and the bow direction, measured in the (bow, starboard) plane the user defined. It works regardless of how the canoe's local axes are oriented because both reference vectors come from the user.
+
+All three former call-sites (`get_star_house`, `get_star_house_error`, the per-frame `_process` ring update) call `_hull_relative_bearing`. `_ring_local_position` was rewritten the same way:
+
+```gdscript
+func _ring_local_position(rel: float, lift: float) -> Vector3:
+    var pos: Vector3 = (cos(rel) * bow_axis_local + sin(rel) * starboard_axis_local) * ring_radius
+    pos.y = lift
+    return pos
+```
+
+Markers are placed in the canoe's local frame using the user-supplied axes — so the visible ring matches the actual hull, not Godot convention.
+
+**Migration for canoes with bow at +Z, starboard at -X:**
+```
+bow_axis_local       = Vector3( 0, 0,  1)
+starboard_axis_local = Vector3(-1, 0,  0)
+```
+
+`get_canoe_world_yaw()` is preserved as public API but is now derived from `bow_axis_local` projected through the canoe's basis — no longer reads from the compass's own (un-rotated) basis.
 
 ---
 
