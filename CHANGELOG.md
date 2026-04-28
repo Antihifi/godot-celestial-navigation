@@ -329,6 +329,33 @@ A useful future addon helper would be `CelestialSphere.estimate_star_rise_hour(s
 
 ---
 
+## 12. VoyageRegistry: register both outbound and inbound chants per moai pair (fixed)
+
+**File:** `voyage_registry.gd`, `_resolve_pending_for()`
+
+**Symptom:** With a learned `Isle 0 → Isle 1` chant active, the system can falsely report *"Stars aligned — hold your heading"* while the player is sailing the *opposite* direction (`Isle 1 → Isle 0`). There is also no chant the player can switch to for the return trip — they're stuck with one direction's data.
+
+**Root cause:** Routes were computed in a single direction at moai-build time. Real Polynesian wayfinding uses distinct outbound and inbound chants because the bearings between two islands are 180° apart, which yields different best-aligned guide stars at different hours of night. A single Route can't represent both directions.
+
+**Fix:** After computing the forward route, also compute the reverse:
+
+```gdscript
+var fwd := _compute_route(p.origin_id, new_island_id)
+if fwd:
+    _routes.append(fwd)
+    route_learned.emit(fwd)
+var rev := _compute_route(new_island_id, p.origin_id)
+if rev:
+    _routes.append(rev)
+    route_learned.emit(rev)
+```
+
+`route_learned` fires twice per moai-pair resolution. Downstream chant-list UIs that accumulate routes (a single list-of-rows is the typical pattern) automatically render two entries — one outbound, one inbound — and the player picks whichever matches their current heading.
+
+When the wrong-direction chant is active, the guide star's bow-relative house no longer matches `target_house` (because the star's geometry differs between the two directions), so the false "Stars aligned" goes away naturally.
+
+---
+
 ## TODO — Additional tuning / docs
 
 - Document the `top_level = true` design in the addon README since it's a

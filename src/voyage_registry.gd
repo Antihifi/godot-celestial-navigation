@@ -146,10 +146,18 @@ func _resolve_pending_for(new_island_id: String, new_island_pos: Vector3) -> voi
 			# Drop the pending entry — without an origin beacon we can't
 			# compute a bearing.
 			continue
-		var route := _compute_route(p.origin_id, new_island_id)
-		if route:
-			_routes.append(route)
-			route_learned.emit(route)
+		var fwd := _compute_route(p.origin_id, new_island_id)
+		if fwd:
+			_routes.append(fwd)
+			route_learned.emit(fwd)
+		# Real wayfinding uses distinct outbound/inbound chants — the
+		# reverse bearing yields a different best-aligned star and hour.
+		# Register both directions so the player has the right chant to
+		# follow whichever way they're sailing the pair.
+		var rev := _compute_route(new_island_id, p.origin_id)
+		if rev:
+			_routes.append(rev)
+			route_learned.emit(rev)
 		# else: no visible star aligned — rare, but possible for due-north
 		# or due-south routes on an equatorial latitude. The discovery is
 		# consumed regardless; the island is registered, you just don't
